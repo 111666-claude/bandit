@@ -128,7 +128,9 @@ class ManagerTests(testtools.TestCase):
         self.assertEqual({"/a/a.py", "/a/b.py"}, inc)
 
     def test_populate_baseline_success(self):
-        # Test populate_baseline with valid JSON
+        # Test populate_baseline with valid JSON. Severity and confidence
+        # values in the report use lower case; loading the baseline must
+        # normalize them to upper-case so they match issues from a new scan.
         baseline_data = """{
             "results": [
                 {
@@ -154,9 +156,9 @@ class ManagerTests(testtools.TestCase):
         issue_dictionary = {
             "code": "test code",
             "filename": "example_file.py",
-            "issue_severity": "low",
+            "issue_severity": "LOW",
             "issue_cwe": issue.Cwe(issue.Cwe.MULTIPLE_BINDS).as_dict(),
-            "issue_confidence": "low",
+            "issue_confidence": "LOW",
             "issue_text": "test issue",
             "test_name": "some_test",
             "test_id": "x",
@@ -166,6 +168,9 @@ class ManagerTests(testtools.TestCase):
         baseline_items = [issue.issue_from_dict(issue_dictionary)]
         self.manager.populate_baseline(baseline_data)
         self.assertEqual(baseline_items, self.manager.baseline)
+        # Explicitly confirm the casing normalization took place.
+        self.assertEqual("LOW", self.manager.baseline[0].severity)
+        self.assertEqual("LOW", self.manager.baseline[0].confidence)
 
     @mock.patch("logging.Logger.warning")
     def test_populate_baseline_invalid_json(self, mock_logger_warning):
@@ -360,6 +365,86 @@ class ManagerTests(testtools.TestCase):
                 [issue_a, issue_b, issue_c], [issue_a, issue_b]
             ),
         )
+
+    def test_compare_baseline_duplicate_occurrences(self):
+        # A single baseline occurrence must suppress only one of two repeated
+        # findings rather than every identical finding.
+        baseline_issue = self._get_issue_instance()
+        baseline_issue.fname = "file1.py"
+
+        first = self._get_issue_instance()
+        first.fname = "file1.py"
+        second = self._get_issue_instance()
+        second.fname = "file1.py"
+
+        unmatched = manager._compare_baseline_results(
+            [baseline_issue], [first, second]
+        )
+        self.assertEqual([second], unmatched)
+
+    def test_compare_baseline_path_normalization(self):
+        # The baseline record and the new finding spell the same path
+        # differently and the finding has moved to another line. They must
+        # still be treated as the same issue.
+        baseline_issue = self._get_issue_instance()
+        baseline_issue.fname = "./pkg/./mod.py"
+        baseline_issue.lineno = 4
+
+        current_issue = self._get_issue_instance()
+        current_issue.fname = "pkg/sub/../mod.py"
+        current_issue.lineno = 42
+
+        self.assertEqual(
+            [],
+            manager._compare_baseline_results(
+                [baseline_issue], [current_issue]
+            ),
+        )
+
+    def test_parse_nosec_comment_multiple_rules(self):
+        # Both comma spacing variants must retain every referenced rule.
+        self.assertEqual(
+            {"B602", "B101"},
+            manager._parse_nosec_comment("# nosec B602,B101"),
+        )
+        self.assertEqual(
+            {"B602", "B101"},
+            manager._parse_nosec_comment("# nosec B602, B101"),
+        )
+        # Whitespace-separated rule ids keep working.
+        self.assertEqual(
+            {"B607", "B602"},
+            manager._parse_nosec_comment("# nosec B607 B602"),
+        )
+
+    def test_parse_nosec_comment_blanket_and_none(self):
+        # A bare nosec comment means "suppress everything" (empty set).
+        self.assertEqual(set(), manager._parse_nosec_comment("# nosec"))
+        # A comment without any nosec marker yields None.
+        self.assertIsNone(manager._parse_nosec_comment("# a plain comment"))
+
+    def test_parse_nosec_comment_test_name(self):
+        # Plugin test names resolve to their test id.
+        parsed = manager._parse_nosec_comment(
+            "# nosec subprocess_popen_with_shell_equals_true"
+        )
+        self.assertEqual({"B602"}, parsed)
+
+    def test_find_candidate_matches_uses_normalized_path(self):
+        unmatched = self._get_issue_instance()
+        unmatched.fname = "./pkg/mod.py"
+
+        same_file = self._get_issue_instance()
+        same_file.fname = "pkg/./mod.py"
+        same_file.lineno = 50
+
+        other_file = self._get_issue_instance()
+        other_file.fname = "elsewhere/mod.py"
+
+        result = manager._find_candidate_matches(
+            [unmatched], [same_file, other_file]
+        )
+        self.assertEqual([same_file], result[unmatched])
 
     def test_find_candidate_matches(self):
         issue_a = self._get_issue_instance()

@@ -25,7 +25,14 @@ from bandit.core import test_set as b_test_set
 
 LOG = logging.getLogger(__name__)
 NOSEC_COMMENT = re.compile(r"#\s*nosec:?\s*(?P<tests>[^#]+)?#?")
-NOSEC_COMMENT_TESTS = re.compile(r"(?:(B\d+|[a-z\d_]+),?)+", re.IGNORECASE)
+# A test reference inside a ``# nosec`` comment is either a Bandit test id
+# (``B`` followed by digits, e.g. ``B602``) or a plugin test name (a Python
+# identifier, e.g. ``subprocess_popen_with_shell_equals_true``). Matching
+# each token independently - instead of anchoring on the separating commas -
+# ensures that multiple rules written with or without spaces after commas
+# (``B602,B101`` and ``B602, B101``) are all parsed, while ignoring any prose
+# or punctuation surrounding the references.
+NOSEC_COMMENT_TESTS = re.compile(r"B\d+|[A-Za-z_][A-Za-z0-9_]*", re.IGNORECASE)
 PROGRESS_THRESHOLD = 50
 
 
@@ -93,11 +100,24 @@ class BanditManager:
         This will populate a list of baseline issues discovered from a previous
         run of bandit. Later this baseline can be used to filter out the result
         set, see filter_results.
+
+        Severity and confidence values from the report are normalized to
+        upper-case so that baseline files produced with differently cased
+        values (for example ``"low"`` instead of ``"LOW"``) still match the
+        issues found in the current run.
         """
         items = []
         try:
             jdata = json.loads(data)
-            items = [issue.issue_from_dict(j) for j in jdata["results"]]
+            for j in jdata["results"]:
+                baseline_issue = issue.issue_from_dict(j)
+                if isinstance(baseline_issue.severity, str):
+                    baseline_issue.severity = baseline_issue.severity.upper()
+                if isinstance(baseline_issue.confidence, str):
+                    baseline_issue.confidence = (
+                        baseline_issue.confidence.upper()
+                    )
+                items.append(baseline_issue)
         except Exception as e:
             LOG.warning("Failed to load baseline data: %s", e)
         self.baseline = items
@@ -431,11 +451,29 @@ def _compare_baseline_results(baseline, results):
     This function compares a baseline set of issues to a current set of issues
     to find results that weren't present in the baseline.
 
+    Issues are matched on their identity fields (text, severity, confidence,
+    test, test id and normalized file name) rather than on line numbers, since
+    line numbers are expected to shift as code evolves and file paths may be
+    spelled differently between runs. A multiset comparison is used so that
+    repeated occurrences of the same issue are matched one-to-one: a baseline
+    suppresses at most the same number of occurrences that it reported.
+
     :param baseline: Baseline list of issues
     :param results: Current list of issues
     :return: List of unmatched issues
     """
-    return [a for a in results if a not in baseline]
+    # Copy the baseline so the manager's stored baseline is not consumed.
+    remaining_baseline = list(baseline)
+    unmatched = []
+    for current_issue in results:
+        for idx, baseline_issue in enumerate(remaining_baseline):
+            if current_issue == baseline_issue:
+                # One baseline occurrence suppresses one current occurrence.
+                del remaining_baseline[idx]
+                break
+        else:
+            unmatched.append(current_issue)
+    return unmatched
 
 
 def _find_candidate_matches(unmatched_issues, results_list):
@@ -446,6 +484,10 @@ def _find_candidate_matches(unmatched_issues, results_list):
     issues in the file are new, so it will show all three.  The user should
     be able to pick out the new one.
 
+    Candidates are collected per normalized file name and test id, so issues
+    remain comparable even when the source file moved or its path is recorded
+    with a different spelling between runs.
+
     :param unmatched_issues: List of issues that weren't present before
     :param results_list: main list of current Bandit findings
     :return: A dictionary with a list of candidates for each issue
@@ -455,7 +497,9 @@ def _find_candidate_matches(unmatched_issues, results_list):
 
     for unmatched in unmatched_issues:
         issue_candidates[unmatched] = [
-            i for i in results_list if unmatched == i
+            i
+            for i in results_list
+            if issue.issue_match_key(i) == issue.issue_match_key(unmatched)
         ]
 
     return issue_candidates
@@ -491,7 +535,7 @@ def _parse_nosec_comment(comment):
         extman = extension_loader.MANAGER
         # lookup tests by short code or name
         for test in NOSEC_COMMENT_TESTS.finditer(nosec_tests):
-            test_match = test.group(1)
+            test_match = test.group(0)
             test_id = _find_test_id_from_nosec_string(extman, test_match)
             if test_id:
                 test_ids.add(test_id)

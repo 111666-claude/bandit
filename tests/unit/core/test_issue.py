@@ -129,6 +129,67 @@ class IssueTests(testtools.TestCase):
         except UnicodeDecodeError:
             self.fail("Bytes not properly decoded in issue.get_code()")
 
+    def test_normalize_path(self):
+        # Redundant current-directory markers and parent traversals collapse.
+        self.assertEqual(
+            "pkg/mod.py", issue.normalize_path("./pkg/./mod.py")
+        )
+        self.assertEqual(
+            "pkg/mod.py", issue.normalize_path("pkg/sub/../mod.py")
+        )
+        self.assertEqual(
+            "pkg/mod.py", issue.normalize_path("pkg//mod.py")
+        )
+        # Absolute paths stay absolute.
+        self.assertEqual(
+            "/tmp/pkg/mod.py",
+            issue.normalize_path("/tmp/pkg/./mod.py"),
+        )
+        # Non-string values (e.g. the "<stdin>" marker is a string, but guard
+        # against unexpected types) are returned untouched.
+        self.assertEqual(None, issue.normalize_path(None))
+
+    def test_equality_normalizes_file_path(self):
+        issue_a = _get_issue_instance()
+        issue_a.fname = "./pkg/mod.py"
+
+        issue_b = _get_issue_instance()
+        issue_b.fname = "pkg/sub/../mod.py"
+
+        # Differently spelled paths to the same file still compare equal.
+        self.assertEqual(issue_a, issue_b)
+
+    def test_equality_distinguishes_normalized_files(self):
+        issue_a = _get_issue_instance()
+        issue_a.fname = "pkg/mod.py"
+
+        issue_b = _get_issue_instance()
+        issue_b.fname = "other/mod.py"
+
+        self.assertNotEqual(issue_a, issue_b)
+
+    def test_issue_match_key_normalizes_and_groups(self):
+        issue_a = _get_issue_instance()
+        issue_a.fname = "./pkg/mod.py"
+        issue_a.lineno = 1
+
+        # Same normalized file/test, different line and lower-case ranking.
+        issue_b = _get_issue_instance()
+        issue_b.fname = "pkg/./mod.py"
+        issue_b.lineno = 99
+        issue_b.severity = bandit.MEDIUM.lower()
+        issue_b.confidence = bandit.MEDIUM.lower()
+
+        self.assertEqual(
+            issue.issue_match_key(issue_a), issue.issue_match_key(issue_b)
+        )
+
+        issue_c = _get_issue_instance()
+        issue_c.test_id = "B101"
+        self.assertNotEqual(
+            issue.issue_match_key(issue_a), issue.issue_match_key(issue_c)
+        )
+
 
 def _get_issue_instance(
     severity=bandit.MEDIUM,

@@ -3,8 +3,33 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 import linecache
+import os.path
 
 from bandit.core import constants
+
+
+def normalize_path(path):
+    """Normalize a file path for comparison between Bandit runs.
+
+    The same source file can be reported using differently spelled paths, for
+    example ``./module/code.py`` vs ``module/code.py``, ``a/../b.py`` vs
+    ``b.py`` or paths with redundant separators. Baseline comparisons must not
+    treat these as different files. The path is normalized lexically (without
+    resolving symlinks or making it absolute, so scans stay reproducible) and
+    trailing path separators are stripped.
+
+    :param path: The file path as recorded on an issue
+    :return: A canonical string representation of the path, or the original
+        value untouched when it is not a string (e.g. the ``<stdin>`` marker)
+    """
+    if not isinstance(path, str):
+        return path
+    # Pure lexical normalization: collapses "./", "../" and duplicate
+    # separators without touching the filesystem.
+    normalized = os.path.normpath(path)
+    if normalized == ".":
+        return path
+    return normalized
 
 
 class Cwe:
@@ -123,20 +148,23 @@ class Issue:
 
     def __eq__(self, other):
         # if the issue text, severity, confidence, and filename match, it's
-        # the same issue from our perspective
+        # the same issue from our perspective. The filename is normalized so
+        # that the same file reached through differently spelled paths (for
+        # example after a directory move or a change of working directory) is
+        # still considered the same file; line numbers are deliberately not
+        # compared because they are expected to shift as code evolves.
         match_types = [
             "text",
             "severity",
             "cwe",
             "confidence",
-            "fname",
             "test",
             "test_id",
         ]
         return all(
             getattr(self, field) == getattr(other, field)
             for field in match_types
-        )
+        ) and normalize_path(self.fname) == normalize_path(other.fname)
 
     def __ne__(self, other):
         return not self.__eq__(other)
@@ -237,6 +265,29 @@ def cwe_from_dict(data):
     cwe = Cwe()
     cwe.from_dict(data)
     return cwe
+
+
+def issue_match_key(target_issue):
+    """Build a hashable key describing where an issue could resurface.
+
+    The key is used to group candidate findings for a given (unmatched)
+    issue. It is based on the normalized file name and the test identity,
+    with severity and confidence compared case-insensitively, because
+    baseline reports may have been produced on a different platform or with
+    different casing for these fields. Line numbers are intentionally
+    excluded so that findings which merely moved within a file remain
+    comparable.
+
+    :param target_issue: The issue to build the key for
+    :return: A tuple usable as a dictionary key
+    """
+    return (
+        normalize_path(target_issue.fname),
+        target_issue.test_id,
+        target_issue.test,
+        str(target_issue.severity).upper(),
+        str(target_issue.confidence).upper(),
+    )
 
 
 def issue_from_dict(data):

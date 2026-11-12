@@ -127,6 +127,7 @@ This formatter outputs the issues in SARIF formatted JSON.
 """  # noqa: E501
 import datetime
 import logging
+import os.path
 import pathlib
 import sys
 import urllib.parse as urlparse
@@ -136,6 +137,7 @@ from jschema_to_python.to_json import to_json
 
 import bandit
 from bandit.core import docs_utils
+from bandit.core import test_properties
 
 LOG = logging.getLogger(__name__)
 SCHEMA_URI = "https://json.schemastore.org/sarif-2.1.0.json"
@@ -143,6 +145,7 @@ SCHEMA_VER = "2.1.0"
 TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
+@test_properties.accepts_baseline
 def report(manager, fileobj, sev_level, conf_level, lines=-1):
     """Prints issues in SARIF format
 
@@ -185,7 +188,14 @@ def report(manager, fileobj, sev_level, conf_level, lines=-1):
     skips = manager.get_skipped()
     add_skipped_file_notifications(skips, invocation)
 
-    issues = manager.get_issue_list(sev_level=sev_level, conf_level=conf_level)
+    issue_list = manager.get_issue_list(
+        sev_level=sev_level, conf_level=conf_level
+    )
+    # When a baseline is in use, get_issue_list() returns an OrderedDict
+    # mapping each unmatched issue to its candidate issues rather than a
+    # plain list. Flatten it so every reported issue (the unmatched finding
+    # plus its candidates) is emitted as a SARIF result.
+    issues = _flatten_issue_list(issue_list)
 
     add_results(issues, run)
 
@@ -196,6 +206,29 @@ def report(manager, fileobj, sev_level, conf_level, lines=-1):
 
     if fileobj.name != sys.stdout.name:
         LOG.info("SARIF output written to file: %s", fileobj.name)
+
+
+def _flatten_issue_list(issue_list):
+    """Normalize the value of get_issue_list() into a list of issues.
+
+    Without a baseline the manager returns a list of issues. With a baseline
+    it returns an OrderedDict of issue -> candidate issues. The SARIF format
+    has no concept of candidate groupings, so the dictionary is flattened:
+    each unmatched issue and every one of its candidates becomes a result.
+
+    :param issue_list: a list of issues or an OrderedDict of issue candidates
+    :return: a flat list of issue objects
+    """
+    if isinstance(issue_list, dict):
+        flattened = []
+        for unmatched_issue, candidates in issue_list.items():
+            if unmatched_issue not in flattened:
+                flattened.append(unmatched_issue)
+            for candidate in candidates:
+                if candidate not in flattened:
+                    flattened.append(candidate)
+        return flattened
+    return list(issue_list)
 
 
 def add_skipped_file_notifications(skips, invocation):
@@ -229,20 +262,35 @@ def add_results(issues, run):
     if run.results is None:
         run.results = []
 
-    rules = {}
+    # Issues without a test id cannot be mapped to a SARIF rule; skip them
+    # rather than emitting a rule with an empty id. This can happen with
+    # partially populated candidate issues from baseline comparisons.
+    issues = [i for i in issues if getattr(i, "test_id", None)]
+
+    # Build the rule table first so every ruleIndex is guaranteed to point at
+    # the rule's actual position in the serialized driver.rules list. Rules
+    # are de-duplicated by test id and ordered deterministically by id.
     rule_indices = {}
+    rules = []
+    for index, rule_id in enumerate(sorted({i.test_id for i in issues})):
+        rule = create_rule(rule_id, issues)
+        rules.append(rule)
+        rule_indices[rule_id] = index
+
     for issue in issues:
         result = create_result(issue, rules, rule_indices)
         run.results.append(result)
 
     if len(rules) > 0:
-        run.tool.driver.rules = list(rules.values())
+        run.tool.driver.rules = rules
 
 
 def create_result(issue, rules, rule_indices):
     issue_dict = issue.as_dict()
 
-    rule, rule_index = create_or_find_rule(issue_dict, rules, rule_indices)
+    rule_id = issue_dict["test_id"]
+    rule = rules[rule_indices[rule_id]]
+    rule_index = rule_indices[rule_id]
 
     physical_location = om.PhysicalLocation(
         artifact_location=om.ArtifactLocation(
@@ -265,13 +313,16 @@ def create_result(issue, rules, rule_indices):
         level=level_from_severity(issue_dict["issue_severity"]),
         locations=[om.Location(physical_location=physical_location)],
         properties={
-            "issue_confidence": issue_dict["issue_confidence"],
-            "issue_severity": issue_dict["issue_severity"],
+            "issue_confidence": str(issue_dict["issue_confidence"]).upper(),
+            "issue_severity": str(issue_dict["issue_severity"]).upper(),
         },
     )
 
 
 def level_from_severity(severity):
+    # Normalize to upper-case so baselines or hand-written reports using
+    # lower/mixed case values are mapped to the correct SARIF level.
+    severity = str(severity).upper()
     if severity == "HIGH":
         return "error"
     elif severity == "MEDIUM":
@@ -285,10 +336,22 @@ def level_from_severity(severity):
 def add_region_and_context_region(
     physical_location, line_range, col_offset, end_col_offset, code
 ):
+    # Some issues (for example candidate issues synthesized during a baseline
+    # comparison) may not carry a populated line range. Fall back to a single
+    # line at line 1 rather than raising an IndexError.
+    if not line_range:
+        line_range = [1]
+
     if code:
         first_line_number, snippet_lines = parse_code(code)
-        snippet_line = snippet_lines[line_range[0] - first_line_number]
-        snippet = om.ArtifactContent(text=snippet_line)
+        snippet_index = line_range[0] - first_line_number
+        # Guard against code snippets that do not actually cover the reported
+        # line (e.g. the file changed between the baseline run and now).
+        if 0 <= snippet_index < len(snippet_lines):
+            snippet_line = snippet_lines[snippet_index]
+            snippet = om.ArtifactContent(text=snippet_line)
+        else:
+            snippet = None
     else:
         snippet = None
 
@@ -339,12 +402,21 @@ def parse_code(code):
     return first_line_number, snippet_lines
 
 
-def create_or_find_rule(issue_dict, rules, rule_indices):
-    rule_id = issue_dict["test_id"]
-    if rule_id in rules:
-        return rules[rule_id], rule_indices[rule_id]
+def create_rule(rule_id, issues):
+    """Create the SARIF reporting descriptor for a Bandit test id.
 
-    rule = om.ReportingDescriptor(
+    The first issue carrying the rule id supplies the descriptive fields;
+    confidence values are normalized to lower-case as required by the SARIF
+    ``precision`` property.
+
+    :param rule_id: the Bandit test id (e.g. ``B104``)
+    :param issues: all issues being reported
+    :return: a populated ReportingDescriptor
+    """
+    representative = next(i for i in issues if i.test_id == rule_id)
+    issue_dict = representative.as_dict()
+
+    return om.ReportingDescriptor(
         id=rule_id,
         name=issue_dict["test_name"],
         help_uri=docs_utils.get_url(rule_id),
@@ -353,18 +425,16 @@ def create_or_find_rule(issue_dict, rules, rule_indices):
                 "security",
                 f"external/cwe/cwe-{issue_dict['issue_cwe'].get('id')}",
             ],
-            "precision": issue_dict["issue_confidence"].lower(),
+            "precision": str(issue_dict["issue_confidence"]).lower(),
         },
     )
 
-    index = len(rules)
-    rules[rule_id] = rule
-    rule_indices[rule_id] = index
-    return rule, index
-
 
 def to_uri(file_path):
-    pure_path = pathlib.PurePath(file_path)
+    # Normalize the path lexically first so that differently spelled paths to
+    # the same file (e.g. "./module/code.py" and "module/code.py") produce the
+    # same artifact URI.
+    pure_path = pathlib.PurePath(os.path.normpath(file_path))
     if pure_path.is_absolute():
         return pure_path.as_uri()
     else:
